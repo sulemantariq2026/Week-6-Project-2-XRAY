@@ -1,174 +1,213 @@
-<div align="center">
+# Chest X-ray Pneumonia Classification
 
-# 📖 Week 7 · Text and Multimodal AI
+A PyTorch pipeline that classifies chest X-rays as **NORMAL** or **PNEUMONIA**, built with a focus on trustworthy evaluation: patient-level splits, leakage and duplicate checks, a recall-targeted decision threshold, prevalence-aware PPV, and Grad-CAM explanations.
 
-### *My Project 2 model learned to read.*
+> **Disclaimer:** This is an educational project. It is not a medical device and must not be used for clinical decisions.
 
-**Introduction to Applied AI** · BS 8th Semester · Department of Electronics
-Project 2: Deep Learning Applications (Individual)
+---
 
-> 🔗 **Builds on:** [Week 6 · Project 2 · X-ray image classifier](https://github.com/sulemantariq2026/Week-6-Project-2-XRAY), whose trained model (`week6_model.pt`) supplies the *image evidence* in the Week 7 case record.
+## Table of Contents
 
-## 🧭 What this project does
+- [Overview](#overview)
+- [Dataset](#dataset)
+- [Pipeline](#pipeline)
+- [Project Structure](#project-structure)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Outputs](#outputs)
+- [Results](#results)
+- [Design Decisions](#design-decisions)
+- [Limitations](#limitations)
+- [License](#license)
+- [Acknowledgements](#acknowledgements)
 
-Six components, each measured, then fused into one explainable, privacy-safe record.
+---
 
-```mermaid
-flowchart LR
-    A[📨 SMS text] --> B[TF-IDF<br/>word vs char n-grams]
-    B --> C[Logistic regression<br/>macro-F1]
-    D[📝 Domain note] --> E[PII masking<br/>CNIC · phone · email]
-    E --> F[spaCy NER<br/>+ EntityRuler]
-    E --> G[Regex fields<br/>+ negative tests]
-    H[🧾 Scanned invoice] --> I[EasyOCR]
-    I --> J[Context repair<br/>CER before / after]
-    K[🖼️ Image] --> L[Week 6 CNN]
-    L --> M{{Case record<br/>JSON}}
-    F --> M
-    G --> M
-    J --> D
-    M --> N[REFER / ROUTINE<br/>+ reasons + disclaimer]
-```
+## Overview
 
-| # | Component | Technique | Metric reported |
-|:-:|---|---|---|
-| 1 | TF-IDF | Smooth IDF + L2 norm, reproduced by hand | hand values = library values; cosine(d2,d3) = 0.544 |
-| 2 | Text classifier | Word 1-2 grams vs char 2-5 grams + logistic regression | macro-F1, spam precision / recall, top features |
-| 3 | NER | spaCy `en_core_web_sm` + `EntityRuler` before `ner` | exact-match entity F1, before → after |
-| 4 | Regex fields | CNIC, mobile, amount, date, email, invoice + domain patterns | positive **and** negative tests |
-| 5 | OCR | EasyOCR + context repair (`O→0`, `l→1`, `N0.→No.`) | character error rate, before → after |
-| 6 | Case record | Week 6 image model + text evidence, PII masked **first** | transparent JSON with reasons |
+Accuracy alone is a poor way to judge a medical imaging model. This project goes further by:
 
-## 📊 Results
+1. Indexing every image with a **patient group ID** so that no patient appears in both train and validation.
+2. Handling **class imbalance** with a weighted loss.
+3. Choosing a decision **threshold on the validation set** to reach a target recall (sensitivity), then reporting test performance at that threshold.
+4. Showing how **PPV collapses as disease prevalence falls**, for example in community screening at 5% prevalence.
+5. Auditing the data for **exact and near duplicates** and **group overlap** between the official train and test splits.
+6. Explaining predictions with **Grad-CAM** heatmaps for both correct and incorrect cases.
 
-> Run the notebook, then `results.json` and `README_week7_section.md` are generated automatically.
-> Paste your **measured** values here (the numbers below are the lab's published reference values to check against).
+## Dataset
 
-| Measurement | Reference | **Mine** |
-|---|:-:|:-:|
-| TF-IDF `d1` (win / free / cash / now) | 0.584 / 0.445 / 0.584 / 0.345 | |
-| Cosine(d2, d3) | 0.54 | |
-| Word 1-2 gram macro-F1 (SMS) | – | |
-| Char 2-5 gram macro-F1 (SMS) | – | |
-| NER F1, provided 6 sentences, out of the box | 0.533 | |
-| NER F1, provided 6 sentences, with 7 rules | 0.875 | |
-| NER F1, **my** held-out sentences, before → after | – | |
-| CER on lab pairs, before → after | 0.062 / 0.059 / 0.143 → 0.000 | |
-| CER on synthetic invoice, raw → fixed | – | |
+[Chest X-Ray Images (Pneumonia)](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia) (Kermany et al.), available on Kaggle.
 
-## 📂 Repository layout
+Expected layout:
 
 ```
-week7-text-multimodal-ai/
-├── notebooks/
-│   └── Week7_Text_and_Multimodal_AI.ipynb   ← the lab (Parts 1-7, a "Write it" cell after each)
-├── src/
-│   ├── __init__.py
-│   └── text_tools.py                         ← tested regex / CER / OCR-repair / PII-masking helpers
-├── tests/
-│   └── test_text_tools.py                    ← 12 tests incl. negative + privacy tests
-├── data/
-│   └── README.md                             ← which dataset, how to get it
-├── outputs/                                  ← results.json, case_record_example.json (generated)
-├── docs/
-│   └── linkedin_post_template.md
+chest_xray/
+├── train/
+│   ├── NORMAL/
+│   └── PNEUMONIA/
+├── val/        # not used (only 16 images); validation is split from train instead
+└── test/
+    ├── NORMAL/
+    └── PNEUMONIA/
+```
+
+The dataset is **not included** in this repository. Download it from Kaggle and place it anywhere under the working directory, `/kaggle/input`, `/content` or `/mnt`. The code finds it automatically.
+
+## Pipeline
+
+| Step | Task | Description |
+|------|------|-------------|
+| 1 | Indexing | One row per image: path, label, file name, patient group |
+| 2 | Split | Group-aware train/validation split (`GroupShuffleSplit`, 85/15) |
+| 3 | Training | ResNet18 (ImageNet weights), class-weighted cross-entropy, Adam, best checkpoint by validation AUC |
+| 4 | Test report | Classification report, macro-F1, confusion matrix at the default argmax threshold |
+| 5 | Threshold | Threshold chosen on validation for a target recall, then evaluated on test |
+| 6 | Prevalence | PPV curve across prevalence values, with test and 5% screening points |
+| 7 | Grad-CAM | Heatmaps on `layer4[-1]` for correct and incorrect predictions |
+| 8 | Audit | Exact duplicates (file hash), near duplicates (thumbnail distance), group overlap |
+| 9 | Export | Model checkpoint, `metrics.json`, per-image test predictions |
+
+## Project Structure
+
+```
+.
+├── chest_xray_complete.py   # Full pipeline (cell-marked with `# %%`)
+├── figures/                 # Generated plots
+├── outputs/                 # Model, metrics and predictions
 ├── requirements.txt
-├── .gitignore
 └── README.md
 ```
 
-## 🚀 Quick start
+Rename `chest_xray_complete.py` to match your repository. If you work in a notebook, each `# %%` marker is one cell.
 
-### Option A: Kaggle (recommended, this is what the lab uses)
-1. Create a notebook **"Week 7 - Text and Multimodal"** and turn **Internet ON** (EasyOCR downloads ≈100 MB on first use).
-2. **Add Data → search "SMS Spam Collection Dataset" (uciml)** → add. ([dataset page](https://www.kaggle.com/datasets/uciml/sms-spam-collection-dataset)) The notebook auto-finds `spam.csv` with `glob`, so any Kaggle folder layout works.
-3. Upload your `week6_model.pt` as a **private dataset named `week6-model`** and add it.
-4. Upload `notebooks/Week7_Text_and_Multimodal_AI.ipynb` (*File → Import Notebook*) and **Run All**.
-5. Fill every **✏️ EDIT** cell (your 10 domain sentences, rules, patterns, `EXAMPLE_IMAGE`) and every **✍️ Write it** cell.
+## Installation
 
-### Option B: local
 ```bash
-git clone <your-repo-url> && cd week7-text-multimodal-ai
-python -m venv .venv && source .venv/bin/activate       # Windows: .venv\Scripts\activate
+git clone https://github.com/<your-username>/<your-repo>.git
+cd <your-repo>
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python -m spacy download en_core_web_sm
-python tests/test_text_tools.py                          # 12 tests, no GPU or internet needed
-jupyter lab notebooks/
-```
-Download the dataset locally with the Kaggle CLI (see [`data/README.md`](data/README.md)) and change `path` in Task 2.1.
-
-## 🔐 Privacy by design
-
-Personal identifiers (**CNIC, phone, email**) are masked **before** any entity or field extraction.
-An earlier version masked the displayed note but extracted entities from the *original*, so the phone number re-appeared inside `text_evidence`.
-The notebook now (1) masks first and (2) runs an automatic **leak check** that fails if any digit of the phone/CNIC appears anywhere in the JSON.
-
-## ⚠️ Honest limitations
-
-* Entity F1 on 16 (or 10) gold entities is a **small sample**, so treat it as a demonstration of the method, not a benchmark.
-* The synthetic invoice is clean (fixed font, perfect contrast). Expect much higher CER on real phone photos.
-* The case record is **decision support only; a qualified human decides.**
-* The SMS dataset is English / Roman-Urdu-light and from an older era of spam. Char n-grams help but do not make the model robust to new spam styles.
-
-## 🧪 Example case record (shape)
-
-```json
-{
-  "image": "example.jpeg",
-  "image_probabilities": {"NORMAL": 0.18, "PNEUMONIA": 0.82},
-  "note_masked": "Child aged 4, fever for 3 days and fast breath. Seen at PIMS Islamabad on 12/09/2026. Guardian mobile [PHONE].",
-  "text_evidence": {
-    "entities": [["PIMS", "ORG"], ["Islamabad", "GPE"], ["12/09/2026", "DATE"]],
-    "fields": {"date": ["12/09/2026"]},
-    "urgent_terms": ["fever", "breath"]
-  },
-  "decision": "REFER",
-  "reasons": ["image model: P(PNEUMONIA) = 0.82", "note mentions: fever, breath"],
-  "disclaimer": "Decision support only; a qualified human decides."
-}
-```
-*(Illustrative only. Replace with the real output from your own Week 6 model.)*
-
-## 📌 Week 7 summary (auto-generated by the notebook)
-
-```
-## Week 7: Text and Multimodal AI
-- Text classifier: SMS Spam Collection, [n] texts, macro-F1 [x] (word) vs [x] (char)
-- Top positive / negative features: [..] / [..]
-- NER on my domain: out-of-the-box F1 [x] -> with entity ruler [x]
-- Regex fields extracted: [..]; false positives tested: [..]
-- OCR: CER raw [x] -> after correction rules [x]
-- Pipeline: image model + text evidence -> JSON record (example below)
-- Privacy: CNIC, phone, and email masked before logging
 ```
 
-## 🛠️ Troubleshooting
+`requirements.txt`:
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `IsADirectoryError` reading the CSV | Path points to the folder, not the file | Use the `glob` finder in Task 2.1 (already in the notebook) |
-| `UnicodeDecodeError` reading `spam.csv` | File is Latin-1, not UTF-8 | Keep `encoding='latin-1'` |
-| `OSError: Can't find model 'en_core_web_sm'` | spaCy model missing | `python -m spacy download en_core_web_sm`, then restart |
-| `ValueError: entity_ruler already exists` | Cell run twice | Use `build_nlp()` (fresh pipeline each time) |
-| EasyOCR stuck on download | Internet off | Kaggle Settings → Internet **On** (≈100 MB first run) |
-| `DEMO_MODE = True` in Part 6 | `week6_model.pt` not found | Add the `week6-model` dataset to the notebook |
-| `size mismatch` loading the checkpoint | Backbone differs from training | Check `ckpt['backbone']` and `ckpt['classes']` |
-| Phone digits visible in the JSON | Extraction ran before masking | Call `mask_pii` first, as `case_record` does |
+```
+torch
+torchvision
+numpy
+pandas
+matplotlib
+scikit-learn
+scipy
+Pillow
+```
 
-## 👤 Author
-**Your Name** Suleman Tariq
- Department of Electronics
-Course: Introduction to Applied AI · Instructor: Dr. Faiz Ahmad
- [GitHub](https://github.com/sulemantariq2026)
+A GPU is strongly recommended. The code falls back to CPU, but training will be slow.
 
-## 📄 License & academic integrity
-Code in `src/` is released under the **MIT License** (add a `LICENSE` file when you publish).
-The lab instructions are © Dr. Faiz Ahmad, for enrolled students only, and are **not** redistributed here.
-The SMS Spam Collection belongs to its original authors (UCI ML Repository); it is not included in this repo.
-The domain gold set, patterns and written analysis in the notebook are my own work.
+## Usage
 
-## ➡️ Next: Week 8
-Serve the Project 2 model through a **FastAPI** endpoint (`pip install fastapi uvicorn`), Presentation 2, and Project 3 team formation.
+**Script:**
 
----
-<div align="center"><sub>Built for <b>Introduction to Applied AI</b> · Week 7 · #NLP #spaCy #MultimodalAI #LearningInPublic</sub></div>
+```bash
+python chest_xray_complete.py
+```
+
+**Jupyter / Colab / Kaggle:**
+
+```python
+%run chest_xray_complete.py
+```
+
+On Kaggle, turn **Internet ON** so the pretrained ResNet18 weights can download. Without internet, the model trains from scratch and accuracy will be lower.
+
+### Configuration
+
+Edit the config block at the top of the script:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `POSITIVE` | `'PNEUMONIA'` | Positive class (must match a folder name) |
+| `TARGET_RECALL` | `0.95` | Recall the threshold must reach on validation |
+| `GROUP_PATTERN` | `r'(person\d+)'` | Regex that extracts the patient ID from file names (`None` to disable) |
+| `IMG_SIZE` | `224` | Input resolution |
+| `BATCH` | `32` | Batch size |
+| `EPOCHS` | `5` | Training epochs |
+| `LR` | `1e-4` | Learning rate |
+| `FIG_DIR` | `'figures'` | Where plots are saved |
+| `OUT_DIR` | `'outputs'` | Where the model and metrics are saved |
+
+## Outputs
+
+**Figures** (`figures/`)
+
+| File | Content |
+|------|---------|
+| `01_class_balance.png` | Class distribution by split |
+| `06_confusion_matrix.png` | Test confusion matrix at the default threshold |
+| `07_roc_threshold.png` | Validation ROC with the calibrated test operating point |
+| `08_prevalence_ppv.png` | PPV versus disease prevalence |
+| `09_gradcam.png` | Grad-CAM for correct predictions (top) and errors (bottom) |
+
+**Artifacts** (`outputs/`)
+
+| File | Content |
+|------|---------|
+| `week6_model.pt` | State dict plus classes, backbone, image size and grayscale flag |
+| `metrics.json` | Environment, config, dataset stats, duplicate audit, test metrics |
+| `test_predictions.csv` | Per-image true label, pneumonia probability and prediction |
+
+### Loading the saved model
+
+```python
+import torch
+from torchvision import models
+
+ckpt = torch.load('outputs/week6_model.pt', map_location='cpu')
+model = models.resnet18(weights=None)
+model.fc = torch.nn.Linear(model.fc.in_features, len(ckpt['classes']))
+model.load_state_dict(ckpt['state_dict'])
+model.eval()
+```
+
+## Results
+
+Fill this table from `outputs/metrics.json` after your run.
+
+| Metric | Default threshold | Calibrated threshold |
+|--------|-------------------|----------------------|
+| Accuracy | _ | _ |
+| Macro-F1 | _ | _ |
+| Sensitivity (recall) | _ | _ |
+| Specificity | _ | _ |
+| PPV (test prevalence) | _ | _ |
+| PPV (5% prevalence) | _ | _ |
+| AUC (test) | _ | _ |
+
+Results vary with the random seed, number of epochs and whether pretrained weights were used.
+
+## Design Decisions
+
+- **Patient-level split.** Several X-rays can come from the same patient. A random image-level split would leak patients across train and validation and inflate scores.
+- **Validation split from train.** The official `val` folder has only 16 images, which is too few to tune a threshold reliably.
+- **Threshold chosen on validation, not test.** Picking it on the test set would be test-set tuning. The test set is used only to report the final operating point.
+- **PPV at multiple prevalences.** The test set is heavily enriched with pneumonia cases. PPV in a low-prevalence screening setting is much lower, and the plot makes that visible.
+- **Duplicate and overlap audit.** Exact or near-duplicate images across train and test can silently inflate results, so they are measured and logged.
+
+## Limitations
+
+- Single dataset from one source. No external validation, so generalisation to other hospitals or scanners is unknown.
+- Pediatric images only, so results do not transfer to adults.
+- Grad-CAM shows where the model looked, not why it decided, and can highlight non-clinical artifacts such as markers and borders.
+- Near-duplicate detection uses a simple 16×16 thumbnail distance, which is an approximation.
+- Not clinically validated.
+
+## License
+
+Add your license here (for example MIT). The dataset has its own license and terms on Kaggle.
+
+## Acknowledgements
+
+- Kermany, D. et al., *Identifying Medical Diagnoses and Treatable Diseases by Image-Based Deep Learning*, Cell, 2018.
+- Selvaraju, R. et al., *Grad-CAM: Visual Explanations from Deep Networks via Gradient-based Localization*, ICCV 2017.
+- He, K. et al., *Deep Residual Learning for Image Recognition*, CVPR 2016.
